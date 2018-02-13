@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+OS=$(uname -s)
+
+CHASSIS=<%= chassis %>
+
+if [ "$CHASSIS" == "VMWARE_VIRTUAL" ]; then
+    SERIAL=`dmidecode | grep 'Serial Number:' | head -n 1| tr -d ' ' | awk -F: '{print $2}'`
+    mkdir /data
+elif [ "$CHASSIS" == "AEROSOL_VIRTUAL" ]; then
+    SERIAL=`dmidecode | grep 'UUID:' | head -n 1| tr -d ' ' | awk -F: '{print $2}'`
+    mkdir /data
+elif [ "$OS" == "SunOS" ]; then
+    if [ -f /root/.uscript.lock ]; then
+        echo "we have already ran"
+        exit 0
+    else
+        date > /root/.uscript.lock
+    fi
+    # Grab serial number from zonename
+    SERIAL=`zonename`
+elif [ -d /var/lib/cloud/instance ]; then
+    SERIAL=`basename $(ls /var/lib/cloud/instances)`
+else
+    # Grab serial number from dmidecode
+    SERIAL=`dmidecode |grep -i serial |awk '{print $NF}' |head -n 1`
+fi
+
+if [ ! -f /etc/ict.profile ]; then
+    cat >> /etc/ict.profile << EOP
+CHASSIS=<%= chassis %>
+CONFTAG=<%= conftag %>
+PACKAGE_SIZE=<%= package %>
+LOCATION=<%= location %>
+OWNER=<%= owner %>
+CUSTOMER=<%= customer %>
+SERIAL=${SERIAL}
+CREATOR=<%= creator %>
+NETWORK=<%= network %>
+EOP
+fi
+
+export PATH=$PATH:/usr/local/bin/:/opt/local/bin:/sbin:/usr/sbin
+. /etc/ict.profile
+
+mkdir -p /opt/emeril
+mkdir -p /etc/products
+
+if [ "$OS" == "SunOS" ]; then
+    IP=$(/sbin/ifconfig net0 | awk '/inet/ {print $2}')
+    <% prefix = (network == 'SHARED') ? 'srd' : 'prd' %>
+    HN=$(echo $IP |tr "." "-"|awk '{print "<%= prefix %>-"$1}')
+    DOMAIN=nodes.<%= location %>.dmtio.net
+    echo $DOMAIN > /etc/defaultdomain
+    echo "$IP $HN.$DOMAIN $HN" >> /etc/hosts
+    hostname $HN
+    echo $HN > /etc/nodename
+
+    pkgin -y in pdsh
+
+elif [ -f /etc/centos-release ]; then
+    IP=$(ip route get 255.255.255.255 | grep -Po '(?<=src )(\d{1,3}.){4}')
+    <% prefix = (network == 'SHARED') ? 'srd' : 'prd' %>
+    HN=$(echo $IP |tr "." "-"|awk '{print "<%= prefix %>-"$1}')
+    DOMAIN=nodes.<%= location %>.dmtio.net
+
+    if [ $HN != $(hostname -s) ]; then
+        echo "$HN.$DOMAIN" > /etc/hostname
+        hostname $HN
+        echo "$IP $HN.$DOMAIN $HN" >> /etc/hosts
+    fi
+
+    yum -y install redhat-lsb	# for /lib/lsb/init-functions
+    grep -q log_daemon_msg /lib/lsb/init-functions || echo -e 'log_daemon_msg () {\n\techo $@\n}' >> /lib/lsb/init-functions
+    grep -q log_end_msg /lib/lsb/init-functions || echo -e 'log_end_msg () {\n\tretval=$1\n\tif [ $retval -eq 0 ]; then\n\t\techo "."\n\telse\n\t\techo " failed!"\n\tfi\n\treturn $retval\n}' >> /lib/lsb/init-functions
+
+    yum -y install bind-utils	# for dig
+    yum -y install rsync
+    # No pdsh.  If wanted, put rpm at artifacts.api.56m.vgtf.net and install here.
+
+else
+    IP=$(/sbin/ifconfig eth0 | grep "inet addr" | awk -F: '{print $2}' | awk '{print $1}')
+    <% prefix = (network == 'SHARED') ? 'srd' : 'prd' %>
+    HN=$(echo $IP |tr "." "-"|awk '{print "<%= prefix %>-"$1}')
+    DOMAIN=nodes.<%= location %>.dmtio.net
+
+    if [ $HN != $(hostname -s) ]; then
+        echo "$HN.$DOMAIN" > /etc/hostname
+        hostname $HN
+        echo "$IP $HN.$DOMAIN $HN" >> /etc/hosts
+    fi
+
+    cd /tmp
+    curl -O -k https://artifacts:negvsnpgf@artifacts.api.56m.vgtf.net/pdsh/pdsh_2.26_amd64.deb
+    dpkg -i pdsh_2.26_amd64.deb
+
+fi
+
+which emeril
+if [ $? == 0 ]; then
+    echo "we already have emeril, so assume we already ran"
+    exit 0
+fi
+
+REPO=repo.<%= location %>.dmtio.net
+
+if [ "$OS" == "SunOS" ]; then
+    export PATH=/opt/local/bin:/opt/local/sbin:$PATH
+
+    RET=1
+    until [ ${RET} -eq 0 ]; do
+        host $REPO
+        RET=$?
+        if [ $RET -ne 0 ]; then
+            sleep 10
+        fi
+    done
+
+elif [ -f /etc/centos-release ]; then
+	:	# Already got curl and bash.
+else
+    apt-get update
+    apt-get install -y curl bash
+fi
+
+cd /tmp
+curl -s -L -O http://$REPO/emeril/master/emeril.tar.gz
+cd /opt/emeril
+tar -xf /tmp/emeril.tar.gz
+if [ -f  /opt/emeril/scripts/install.sh ]; then
+    /opt/emeril/scripts/install.sh
+fi
+
+cd /tmp
+ASSETS_URL="assets.services.<%= location %>.dmtio.net"
+[ -z "$(dig +noall +answer +nocomments $ASSETS_URL)" ] && ASSETS_URL='assets.services.dmtio.net'
+curl -O http://$ASSETS_URL/emeril-assets/<%= conftag %>.tgz
+cd /opt/emeril
+tar -xzf /tmp/<%= conftag %>.tgz
+
+rm /tmp/<%= conftag %>.tgz
+
+chown root /opt/emeril/cookbooks
+chmod 0700 /opt/emeril/cookbooks
+
+chown root /opt/emeril/products
+chmod 0700 /opt/emeril/products
+
+
+cat <<EOF > /root/bootstrap.sh
+#!/usr/bin/env bash
+/usr/local/bin/product-install base <%= conftag.downcase %>
+
+/usr/local/bin/emeril base
+/usr/local/sbin/emeril-assets-update
+/usr/local/bin/emeril base
+
+<% products.each do |prod,env| %>
+/usr/local/bin/product-install <%= prod %> <%= env %>
+<% end %>
+<% products.keys.each do |prod| %>
+/usr/local/bin/emeril <%= prod %>
+<% end %>
+
+EOF
+
+echo "bash /root/bootstrap.sh > /var/log/bootstrap.log 2>&1" | at now
+
+<% if defined? extra_stuff %>
+<%= extra_stuff %>     
+<% end %>
+
